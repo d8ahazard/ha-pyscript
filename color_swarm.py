@@ -3,14 +3,18 @@ A collection of lighting effects that runs asynchronously on Philips Hue rooms/g
 Pyscript must be configured to expose the "hass" global variable and allow all imports
 so that we can access the Hue bridge configs and entity registry.
 """
-from aiohue import HueBridgeV2
-from aiohue.v2.models.resource import ResourceTypes
-from homeassistant.helpers import entity_registry as er
-import time
 import heapq
 import random
+import time
 
+import homeassistant
+from homeassistant.helpers import device_registry as dr
+from homeassistant.helpers import entity_registry as er
 
+devreg = homeassistant.helpers.device_registry.async_get(hass)
+entreg = homeassistant.helpers.entity_registry.async_get(hass)
+
+swarm_groups = {}
 # Swarm definitions. Add your own here. To favor a particular color, add multiple instances of it to the palette.
 # Max hold is the maximum number of seconds a bulb will hold its setting before transitioning to a new random color.
 # The other attributes are self-explanatory, I hope.
@@ -198,25 +202,25 @@ swarms = {
         "transition_secs": 1,
         "max_hold_secs": 30,
         "palette": [
-            {
-                # Blackhawk (sorta)
-                "rgb_color": (64, 0, 255),
-                "brightness": 163,
-            },
-            {
-                # Gold
-                "rgb_color": (255, 205, 49),
-                "brightness": 240,
-            },
-        ]
-        + [
-            {
-                # White
-                "kelvin": 3200,
-                "brightness": 255,
-            },
-        ]
-        * 10,
+                       {
+                           # Blackhawk (sorta)
+                           "rgb_color": (64, 0, 255),
+                           "brightness": 163,
+                       },
+                       {
+                           # Gold
+                           "rgb_color": (255, 205, 49),
+                           "brightness": 240,
+                       },
+                   ]
+                   + [
+                       {
+                           # White
+                           "kelvin": 3200,
+                           "brightness": 255,
+                       },
+                   ]
+                   * 10,
     },
     "USA": {
         "transition_secs": 3,
@@ -336,65 +340,78 @@ swarms = {
             },
         ],
     },
+    "Halloween": {
+        "transition_secs": 4,
+        "max_hold_secs": 10,
+        "palette": [
+            {
+                # Orange
+                "rgb_color": (247, 95, 28),
+                "brightness": 255,
+            },
+            {
+                # Light Orange
+                "rgb_color": (255, 154, 0),
+                "brightness": 255,
+            },
+            {
+                # Puuuurple
+                "rgb_color": (136, 30, 228),
+                "brightness": 255,
+            },
+            {
+                # Green
+                "rgb_color": (133, 226, 31),
+                "brightness": 255,
+            },
+        ],
+    },
 }
 
 
-def light_entities_for_group(group_name):
-    """Find light entity IDs for the Philips Hue zone/room name.
+def light_entities_for_area(tgt_area_name):
+    """Find light entity IDs for a specified area. Assumes all lights are color-changing.
 
-    All configured Hue bridges are queried for the group. Pyscript must be configured to expose the
-    "hass" global variable and allow all imports so that we can access the bridge configs and entity
-    registry.
-
-    :param group_name: The Hue zone/room name exactly as it appears in the Hue app (e.g. "Living room").
+    :param tgt_area_name: The HA Area containing the lights.
     :return: Set of light entity IDs for the group name or empty set if no matching group or entities are found.
     """
+    log.info(f"Searching for entities in {tgt_area_name}")
     entity_ids = set()
+    entities = er.async_entries_for_area(entreg, tgt_area_name)
+    if entities:
+        entities.extend([e for x in dr.async_entries_for_area(devreg, tgt_area_name) for e in
+                         homeassistant.helpers.entity_registry.async_entries_for_device(entreg, x.id)])
 
-    # Load entity registry.
-    entity_registry = er.async_get_registry(hass)
-    # Find Hue bridge config(s).
-    for config_entry in hass.config_entries.async_entries(domain="hue"):
-        host, api_key = config_entry.data["host"], config_entry.data["api_key"]
-        async with HueBridgeV2(host, api_key) as bridge:
-            # Query Hue bridge for light services in the matching group(s), if any.
-            for group in bridge.groups:
-                if not hasattr(group, "metadata") or group.metadata.name != group_name:
-                    continue
-
-                lights_resolver = bridge.groups.room if group.type == ResourceTypes.ROOM else bridge.groups.zone
-                light_ids = {light.id for light in lights_resolver.get_lights(group.id)}
-                group_entity_ids = {
-                    id
-                    for id, entity in entity_registry.entities.items()
-                    if entity.unique_id in light_ids and entity.platform == "hue"
-                }
-                log.debug(f"Found Hue group '{group_name}' on {host}; lights: {group_entity_ids}")
-                entity_ids |= group_entity_ids
+    for entity in entities:
+        if "light" in entity.entity_id:
+            modes = entity.capabilities.get("supported_color_modes")
+            log.info(f"Area entity: {entity.id}, modes - {modes}")
+            if "hs" in modes:
+                entity_ids.add(entity.entity_id)
     return entity_ids
 
 
 @service
-def color_swarm_turn_on(hue_group_name="Office", swarm_name="Christmas"):
+def color_swarm_turn_on(area_id="Office", swarm_name="Christmas"):
     """Start the color swarm effect on the specified Philips Hue light group.
 
-    The color swarm comtinues running on the group until it is turned off or turned on with different parameters.
+    The color swarm continues running on the group until it is turned off or turned on with different parameters.
 
-    :param hue_group_name: Name of the Hue light group or room, exactly as it appears in the Hue app. Case-sensitive.
+    :param area_id: ID Of the HA Area to control. Case-sensitive.
     :param swarm_name: The predefined swarm definition including color palette and transitions.
     """
 
     if swarm_name not in swarms:
         raise ValueError(f"Swarm '{swarm_name}' does not exist.")
-    task.unique(f"color-swarm-{hue_group_name}")
-    entity_ids = light_entities_for_group(hue_group_name)
+    task.unique(f"color-swarm-{area_id}")
+    entity_ids = light_entities_for_area(area_id)
     if entity_ids:
         log.info(
-            f"Started '{swarm_name}' color swarm for Hue group '{hue_group_name}' consisting of {len(entity_ids)} light(s)."
+            f"Started '{swarm_name}' color swarm for area '{area_id}' consisting of {len(entity_ids)} light(s)."
         )
     else:
-        log.error(f"No light entities found for Hue group '{hue_group_name}'.")
-
+        log.error(f"No light entities found for area '{area_id}'.")
+    swarm_groups[area_id] = entity_ids
     # Create a priority queue of the next transition per light, sorted by random future transition times.
     swarm = swarms[swarm_name]
     transition_q = []
@@ -424,6 +441,16 @@ def color_swarm_turn_on(hue_group_name="Office", swarm_name="Christmas"):
 
 
 @service
-def color_swarm_turn_off(hue_group_name="Office"):
-    """Stop any running color swarm effect on the specified Philips Hue light group."""
-    task.unique(f"color-swarm-{hue_group_name}")
+def color_swarm_turn_off(area_id="Office"):
+    """Stop any running color swarm effect on the specified area."""
+    log.info(f"Stopping swarm: {area_id}")
+    task.unique(f"color-swarm-{area_id}")
+    if area_id in swarm_groups:
+        entities = swarm_groups[area_id]
+        for entity in entities:
+            light_args = {
+                "entity_id": entity,
+                "transition": 0
+            }
+            light.turn_off(**light_args)
+        log.info(f"Stopped lights for {len(entities)} lights.")
